@@ -115,6 +115,50 @@
 
   ![](F:\learning\github\learing-notes\springkafka\img\kafka目录结构.png)
 
-* 启动kafka服务端,进入在上述的文件目录下执行命令：bin``/windows/zookeeper-server-start``.bat config``/zookeeper``.properties
+* 启动kafka服务端,进入在上述的文件目录下执行命令：bin/windows/zookeeper-server-start.bat config/zookeeper.properties
 
   ![](F:\learning\github\learing-notes\springkafka\img\启动kafka服务端.png)
+
+### 2、下载spring kafka的示例代码
+
+* [下载地址](<https://github.com/spring-projects/spring-kafka>)
+
+![](F:\learning\github\learing-notes\springkafka\img\spring kafka下载示例图.png)
+
+* 导入代码:samples\sample-01
+
+这个示例中的代码的POM文件缺少如下两个依赖，
+
+```xml
+<!-- https://mvnrepository.com/artifact/com.fasterxml.jackson.core/jackson-databind -->
+		<dependency>
+			<groupId>com.fasterxml.jackson.core</groupId>
+			<artifactId>jackson-databind</artifactId>
+			<version>2.9.5</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.hibernate</groupId>
+			<artifactId>hibernate-validator</artifactId>
+			<version>5.3.0.Final</version>
+		</dependency>
+```
+
+* 启动application，在下面的两个地方加上断点。
+
+* 使用postMan访问地址：`http://localhost:8082/send/foo/hello-world` 
+
+* 观察断点出：
+
+  ![](F:\learning\github\learing-notes\springkafka\img\kafka发送消息.png)
+
+  日志输出如下：
+
+  ```txt
+  2019-04-30 17:23:14.245  INFO 14188 --- [ fooGroup-0-C-1] com.example.Application                  : Received: Foo2 [foo=hello-world]
+  ```
+
+  
+
+3、整个demo的源码下载地址[https://github.com/zhang1github2test/learing-notes/tree/master/springkafka](<https://github.com/zhang1github2test/learing-notes/tree/master/springkafka>)
+
