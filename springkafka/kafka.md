@@ -335,3 +335,273 @@ exec $(dirname $0)/kafka-run-class.sh kafka.admin.TopicCommand "$@"
 kafka主题命名规则：主题名不能超过249个字母、数字、着重号下划线、连接号。正则表达式为[a-zA-Z0-9\.\_\-]+。
 
 不允许主题名字只有着重号（.）组成。Kafka 建议为了避免主题名字与这些指标字段名称冲突，主题最好不要包括着重号及下划线字符。
+
+
+
+| 属　性　名                         | 默认值           | 描　　述                                                     |
+| :--------------------------------- | :--------------- | :----------------------------------------------------------- |
+| message.send.max.retries           | 3                | 设置当生产者向代理发信息时，若代理由于各种原因导致接受失败，生产者在丢弃该消息前进行重试的次数 |
+| retry.backoff.ms                   | 100              | 在生产者每次重试之前，生产者会更新主题的 MetaData 信息，以此来检测新的 Leader 是否已选举出来。因为选举 Leader 需要一定时间，所以此选项指定更新主题的 MetaData 之前生产者需要等待的时间，单位为 ms |
+| queue.buffering.max.ms             | 1000             | 在异步模式下，表示消息被缓存的最长时间，单位为 ms，当到达该时间后消息将开始批量发送；若在异步模式下同时配置了缓存数据的最大值 batch.num.messages，则达到这两个阈值之一都将开始批量发送消息 |
+| queue.buffering.max.messages       | 10000            | 在异步模式下，在生产者必须被阻塞或者数据必须丢失之前，可以缓存到队列中的未发送的最大消息条数，即初始化消息队列的长度 |
+| batch.num.messages                 | 200              | 在异步模式下每次批量发送消息的最大消息数                     |
+| request.timeout.ms                 | 1500             | 当需要 acks 时，生产者等待代理应答的超时时间，单位为 ms。若在该时间范围内还没有收到应答，则会发送错误到客户端 |
+| send.buffer.bytes                  | 100kb            | Socket 发送缓冲区大小                                        |
+| topic.metadata.refresh.interval.ms | 5min             | 生产者定时请求更新主题元数据的时间间隔。若设置为0，则在每个消息发送后都去请求更新数据 |
+| client.id                          | console-producer | 生产者指定的一个标识字段，在每次请求中包含该字段，用来追踪调用，根据该字段在逻辑上可以确认是哪个应用发出的请求 |
+| queue.enqueue.timeout.ms           | 2147483647       | 该值为0表示当队列没满时直接入队，满了则立即丢弃，负数表示无条件阻塞且不丢弃，正数表示阻塞达到该值时长后抛出 Qu |
+
+#### KafkaProducer 实现原理
+
+​	KafkaProducer 是线程安全的，在一个 Kafka 集群中多线程之间共享同一个 KafkaProducer 实例通常比创建多个 KafkaProducer 实例性能要好。KafkaProducer 有一个缓存池，用于存储尚未向代理发送的消息，同时一个后台 I/O 线程负责从缓存池中读取消息构造请求，将消息发送至代理。	
+
+`org.apache.kafka.clients.producer.KafkaProducer#send(org.apache.kafka.clients.producer.ProducerRecord<K,V>, org.apache.kafka.clients.producer.Callback)` 方法实现的是异步发送消息，但是callback会被顺序执行，即先后发送两此消息。第一条消息的callback总是先于第二条消息的callback。
+
+* 如何保证被顺序执行？
+  * 会将callback顺序保存在list中
+  * 底层实现的时候将`org.apache.kafka.clients.producer.Callback` 对象与每次发送消息返回的`org.apache.kafka.clients.producer.internals.FutureRecordMetadata ` 对象封装成为一个`org.apache.kafka.clients.producer.internals.ProducerBatch.Thunk`对象。
+  *  `ProducerBatch `会维护一个thunks列表: `private final List<Thunk> thunks = new ArrayList<>();`  
+* 如果想要发送同步消息，该怎么处理？
+  * 使用调用send方法后返回的`Future<RecordMetadata>`  对象，调用该对象的get()方法
+
+1、KafkaProducer 实例化过程
+
+​	源码如下：
+
+```java
+  @SuppressWarnings("unchecked")
+    // visible for testing
+    KafkaProducer(ProducerConfig config,
+                  Serializer<K> keySerializer,
+                  Serializer<V> valueSerializer,
+                  Metadata metadata,
+                  KafkaClient kafkaClient) {
+        try {
+            Map<String, Object> userProvidedConfigs = config.originals();
+            this.producerConfig = config;
+            this.time = Time.SYSTEM;
+            String clientId = config.getString(ProducerConfig.CLIENT_ID_CONFIG);
+            if (clientId.length() <= 0)
+                clientId = "producer-" + PRODUCER_CLIENT_ID_SEQUENCE.getAndIncrement();
+            this.clientId = clientId;
+
+            String transactionalId = userProvidedConfigs.containsKey(ProducerConfig.TRANSACTIONAL_ID_CONFIG) ?
+                    (String) userProvidedConfigs.get(ProducerConfig.TRANSACTIONAL_ID_CONFIG) : null;
+            LogContext logContext;
+            if (transactionalId == null)
+                logContext = new LogContext(String.format("[Producer clientId=%s] ", clientId));
+            else
+                logContext = new LogContext(String.format("[Producer clientId=%s, transactionalId=%s] ", clientId, transactionalId));
+            log = logContext.logger(KafkaProducer.class);
+            log.trace("Starting the Kafka producer");
+
+            Map<String, String> metricTags = Collections.singletonMap("client-id", clientId);
+            MetricConfig metricConfig = new MetricConfig().samples(config.getInt(ProducerConfig.METRICS_NUM_SAMPLES_CONFIG))
+                    .timeWindow(config.getLong(ProducerConfig.METRICS_SAMPLE_WINDOW_MS_CONFIG), TimeUnit.MILLISECONDS)
+                    .recordLevel(Sensor.RecordingLevel.forName(config.getString(ProducerConfig.METRICS_RECORDING_LEVEL_CONFIG)))
+                    .tags(metricTags);
+            List<MetricsReporter> reporters = config.getConfiguredInstances(ProducerConfig.METRIC_REPORTER_CLASSES_CONFIG,
+                    MetricsReporter.class);
+            reporters.add(new JmxReporter(JMX_PREFIX));
+            this.metrics = new Metrics(metricConfig, reporters, time);
+            ProducerMetrics metricsRegistry = new ProducerMetrics(this.metrics);
+            this.partitioner = config.getConfiguredInstance(ProducerConfig.PARTITIONER_CLASS_CONFIG, Partitioner.class);
+            long retryBackoffMs = config.getLong(ProducerConfig.RETRY_BACKOFF_MS_CONFIG);
+            if (keySerializer == null) {
+                this.keySerializer = ensureExtended(config.getConfiguredInstance(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+                                                                                         Serializer.class));
+                this.keySerializer.configure(config.originals(), true);
+            } else {
+                config.ignore(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG);
+                this.keySerializer = ensureExtended(keySerializer);
+            }
+            if (valueSerializer == null) {
+                this.valueSerializer = ensureExtended(config.getConfiguredInstance(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+                                                                                           Serializer.class));
+                this.valueSerializer.configure(config.originals(), false);
+            } else {
+                config.ignore(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG);
+                this.valueSerializer = ensureExtended(valueSerializer);
+            }
+
+            // load interceptors and make sure they get clientId
+            userProvidedConfigs.put(ProducerConfig.CLIENT_ID_CONFIG, clientId);
+            List<ProducerInterceptor<K, V>> interceptorList = (List) (new ProducerConfig(userProvidedConfigs, false)).getConfiguredInstances(ProducerConfig.INTERCEPTOR_CLASSES_CONFIG,
+                    ProducerInterceptor.class);
+            this.interceptors = new ProducerInterceptors<>(interceptorList);
+            ClusterResourceListeners clusterResourceListeners = configureClusterResourceListeners(keySerializer, valueSerializer, interceptorList, reporters);
+            this.maxRequestSize = config.getInt(ProducerConfig.MAX_REQUEST_SIZE_CONFIG);
+            this.totalMemorySize = config.getLong(ProducerConfig.BUFFER_MEMORY_CONFIG);
+            this.compressionType = CompressionType.forName(config.getString(ProducerConfig.COMPRESSION_TYPE_CONFIG));
+
+            this.maxBlockTimeMs = config.getLong(ProducerConfig.MAX_BLOCK_MS_CONFIG);
+            this.requestTimeoutMs = config.getInt(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG);
+            this.transactionManager = configureTransactionState(config, logContext, log);
+            int retries = configureRetries(config, transactionManager != null, log);
+            int maxInflightRequests = configureInflightRequests(config, transactionManager != null);
+            short acks = configureAcks(config, transactionManager != null, log);
+
+            this.apiVersions = new ApiVersions();
+            this.accumulator = new RecordAccumulator(logContext,
+                    config.getInt(ProducerConfig.BATCH_SIZE_CONFIG),
+                    this.totalMemorySize,
+                    this.compressionType,
+                    config.getLong(ProducerConfig.LINGER_MS_CONFIG),
+                    retryBackoffMs,
+                    metrics,
+                    time,
+                    apiVersions,
+                    transactionManager);
+            List<InetSocketAddress> addresses = ClientUtils.parseAndValidateAddresses(config.getList(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG));
+            if (metadata != null) {
+                this.metadata = metadata;
+            } else {
+                this.metadata = new Metadata(retryBackoffMs, config.getLong(ProducerConfig.METADATA_MAX_AGE_CONFIG),
+                    true, true, clusterResourceListeners);
+                this.metadata.update(Cluster.bootstrap(addresses), Collections.<String>emptySet(), time.milliseconds());
+            }
+            ChannelBuilder channelBuilder = ClientUtils.createChannelBuilder(config);
+            Sensor throttleTimeSensor = Sender.throttleTimeSensor(metricsRegistry.senderMetrics);
+            KafkaClient client = kafkaClient != null ? kafkaClient : new NetworkClient(
+                    new Selector(config.getLong(ProducerConfig.CONNECTIONS_MAX_IDLE_MS_CONFIG),
+                            this.metrics, time, "producer", channelBuilder, logContext),
+                    this.metadata,
+                    clientId,
+                    maxInflightRequests,
+                    config.getLong(ProducerConfig.RECONNECT_BACKOFF_MS_CONFIG),
+                    config.getLong(ProducerConfig.RECONNECT_BACKOFF_MAX_MS_CONFIG),
+                    config.getInt(ProducerConfig.SEND_BUFFER_CONFIG),
+                    config.getInt(ProducerConfig.RECEIVE_BUFFER_CONFIG),
+                    this.requestTimeoutMs,
+                    time,
+                    true,
+                    apiVersions,
+                    throttleTimeSensor,
+                    logContext);
+            this.sender = new Sender(logContext,
+                    client,
+                    this.metadata,
+                    this.accumulator,
+                    maxInflightRequests == 1,
+                    config.getInt(ProducerConfig.MAX_REQUEST_SIZE_CONFIG),
+                    acks,
+                    retries,
+                    metricsRegistry.senderMetrics,
+                    Time.SYSTEM,
+                    this.requestTimeoutMs,
+                    config.getLong(ProducerConfig.RETRY_BACKOFF_MS_CONFIG),
+                    this.transactionManager,
+                    apiVersions);
+            String ioThreadName = NETWORK_THREAD_PREFIX + " | " + clientId;
+            this.ioThread = new KafkaThread(ioThreadName, this.sender, true);
+            this.ioThread.start();
+            this.errors = this.metrics.sensor("errors");
+            config.logUnused();
+            AppInfoParser.registerAppInfo(JMX_PREFIX, clientId, metrics);
+            log.debug("Kafka producer started");
+        } catch (Throwable t) {
+            // call close methods if internal objects are already constructed this is to prevent resource leak. see KAFKA-2121
+            close(0, TimeUnit.MILLISECONDS, true);
+            // now propagate the exception
+            throw new KafkaException("Failed to construct kafka producer", t);
+        }
+    }
+```
+
+该源码主要做了如下事情：
+
+(1)、从config中解析出client.id，生产者指定该配置项的值以便追踪程序的运行情况，为String 类型，默认值为“”；如果没有进行设置，会通过以下代码进行设置:以前辍“producer-”后加一个从1递增的整数。
+
+```java
+if (clientId.length() <= 0)
+                clientId = "producer-" + PRODUCER_CLIENT_ID_SEQUENCE.getAndIncrement();
+            this.clientId = clientId;
+```
+
+（2）根据配置项创建和注册用于 Kafka metrics 指标收集的相关对象，用于对 Kafka 集群相关指标的追踪。
+
+具体代码如下：
+
+```java
+       //创建一个  度量指标的配置类
+            Map<String, String> metricTags = Collections.singletonMap("client-id", clientId);
+            //1、样本数量默认值为; 2、度量样本的计算时间窗口  默认值为：30s ;3、度量的最高记录级别 默认值为：INFO
+            MetricConfig metricConfig = new MetricConfig().samples(config.getInt(ProducerConfig.METRICS_NUM_SAMPLES_CONFIG))
+                    .timeWindow(config.getLong(ProducerConfig.METRICS_SAMPLE_WINDOW_MS_CONFIG), TimeUnit.MILLISECONDS)
+                    .recordLevel(Sensor.RecordingLevel.forName(config.getString(ProducerConfig.METRICS_RECORDING_LEVEL_CONFIG)))
+                    .tags(metricTags);
+            List<MetricsReporter> reporters = config.getConfiguredInstances(ProducerConfig.METRIC_REPORTER_CLASSES_CONFIG,
+                    MetricsReporter.class);
+            reporters.add(new JmxReporter(JMX_PREFIX));
+            this.metrics = new Metrics(metricConfig, reporters, time);
+            ProducerMetrics metricsRegistry = new ProducerMetrics(this.metrics);
+```
+
+（3）实例化分区器。分区器用于为消息指定分区，客户端可以通过实现 Partitioner 接口自定义消息分配分区的规则。若用户没有自定义分区器，则在 KafkaProducer 实例化时会使用默认的 DefaultPartitioner，该分区器分配分区的规则是：若消息指定了 Key，则对 Key 取 hash 值，然后与可用的分区总数求模；若没有指定 Key，则 DefalutPartitioner 通过一个随机数与可用的总分区数取模。
+
+`DefalutPartitioner ` 分区源码如下：
+
+```java
+    public int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes, Cluster cluster) {
+        List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
+        int numPartitions = partitions.size();
+        if (keyBytes == null) {
+            int nextValue = nextValue(topic);
+            List<PartitionInfo> availablePartitions = cluster.availablePartitionsForTopic(topic);
+            if (availablePartitions.size() > 0) {
+                int part = Utils.toPositive(nextValue) % availablePartitions.size();
+                return availablePartitions.get(part).partition();
+            } else {
+                // no partitions are available, give a non-available partition
+                return Utils.toPositive(nextValue) % numPartitions;
+            }
+        } else {
+            // hash the keyBytes to choose a partition
+            return Utils.toPositive(Utils.murmur2(keyBytes)) % numPartitions;
+        }
+    }
+```
+
+实例化分区器 的源码如下：
+
+```java
+            //实例化分区器    键为:partitioner.class   默认的类为：org.apache.kafka.clients.producer.internals.DefaultPartitioner
+            this.partitioner = config.getConfiguredInstance(ProducerConfig.PARTITIONER_CLASS_CONFIG, Partitioner.class);
+            //尝试重试对给定主题分区的失败请求之前等待的时间。这避免了在某些故障场景下重复地在紧密循环中发送请求   默认值为100ms
+            long retryBackoffMs = config.getLong(ProducerConfig.RETRY_BACKOFF_MS_CONFIG);
+```
+
+（4）实例化消息 Key 和 Value 进行序列化操作的 Serializer。Kafka 实现了七种基本类型的 Serializer，如 BytesSerializer、IntegerSerializer、LongSerializer 等。用户也可以实现 Serializer 接口分别为 Key 和 Value 自定义序列化方式，当然在消费者消费消息时要实现相应的反序列化操作。若用户不指定 Serializer，默认 Key 和 Value 使用相同的 ByteArraySerializer。
+
+Key 和 Value 进行序列化操作的 Serializer源码如下：
+
+```java
+ if (keySerializer == null) {
+                this.keySerializer = ensureExtended(config.getConfiguredInstance(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+                        Serializer.class));
+                this.keySerializer.configure(config.originals(), true);
+            } else {
+                config.ignore(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG);
+                this.keySerializer = ensureExtended(keySerializer);
+            }
+            if (valueSerializer == null) {
+                this.valueSerializer = ensureExtended(config.getConfiguredInstance(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+                        Serializer.class));
+                this.valueSerializer.configure(config.originals(), false);
+            } else {
+                config.ignore(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG);
+                this.valueSerializer = ensureExtended(valueSerializer);
+            }
+```
+
+（5）根据配置实例化一组拦截器（ProducerInterceptor），用户可以指定多个拦截器。如果我们希望在消息发送前、消息发送到代理并 ack、消息还未到达代理而失败或调用 send() 方法失败这几种情景下进行相应处理操作，就可以通过自定义拦截器实现该接口中相应方法，多个拦截器会被顺序调用执行。
+
+
+
+```java
+  userProvidedConfigs.put(ProducerConfig.CLIENT_ID_CONFIG, clientId);
+            List<ProducerInterceptor<K, V>> interceptorList = (List) (new ProducerConfig(userProvidedConfigs, false)).getConfiguredInstances(ProducerConfig.INTERCEPTOR_CLASSES_CONFIG,
+                    ProducerInterceptor.class);
+            this.interceptors = new ProducerInterceptors<>(interceptorList);
+```
+
